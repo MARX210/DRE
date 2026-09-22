@@ -1,0 +1,6 @@
+{
+  "name": "Gestão de Educação Especial - SEDUC-PA (DRE Altamira)",
+  "description": "Sistema do Núcleo de Educação Especial da DRE Altamira / SEDUC-PA para acompanhamento do AEE, semáforo de atendimento, gestão de PDI, geração de ofícios e controle por escola.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

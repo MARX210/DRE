@@ -1,0 +1,64 @@
+@import "tailwindcss";
+
+#__area_impressao_direta__ {
+  display: none;
+}
+
+@media print {
+  body {
+    background: #ffffff !important;
+    color: #000000 !important;
+    overflow: visible !important;
+    height: auto !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+
+  /* Quando imprimindo documento oficial dedicado, oculta a árvore da aplicação React */
+  body.imprimindo-documento-oficial #root {
+    display: none !important;
+  }
+
+  body.imprimindo-documento-oficial #__area_impressao_direta__ {
+    display: block !important;
+    position: static !important;
+    width: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    background: #ffffff !important;
+    color: #000000 !important;
+  }
+
+  /* Oculta toda a interface de navegação e controles quando a impressão do navegador for acionada */
+  nav,
+  aside,
+  header,
+  #btn-topo-logout,
+  #modal-impressao-documento-barra-acoes,
+  .print\:hidden,
+  [data-print-hidden="true"] {
+    display: none !important;
+  }
+
+  #modal-impressao-documento {
+    position: static !important;
+    background: transparent !important;
+    padding: 0 !important;
+    overflow: visible !important;
+  }
+
+  #modal-impressao-documento-conteudo {
+    padding: 0 !important;
+    background: transparent !important;
+    overflow: visible !important;
+    display: block !important;
+  }
+
+  /* Garante que modais abertos quebrem e fluam como documento contínuo na impressão */
+  .fixed.inset-0 {
+    position: static !important;
+    background: transparent !important;
+    padding: 0 !important;
+    overflow: visible !important;
+  }
+}

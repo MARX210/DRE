@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 120" width="480" height="120">
+  <defs>
+    <linearGradient id="flagRed" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#cc1010" />
+      <stop offset="100%" stop-color="#a00808" />
+    </linearGradient>
+  </defs>
+
+  <!-- Bandeira estilizada do Pará -->
+  <g transform="translate(10, 15)">
+    <!-- Fundo da Bandeira -->
+    <rect x="0" y="0" width="130" height="90" rx="8" fill="url(#flagRed)" />
+    <!-- Faixa Diagonal Branca -->
+    <path d="M 0,0 L 40,0 L 130,65 L 130,90 L 90,90 L 0,25 Z" fill="#ffffff" />
+    <!-- Estrela Azul no Centro da Faixa -->
+    <polygon points="65,30 68,40 78,40 70,46 73,56 65,50 57,56 60,46 52,40 62,40" fill="#003e99" />
+    <!-- Borda sutil -->
+    <rect x="0" y="0" width="130" height="90" rx="8" fill="none" stroke="#ffffff" stroke-width="1.5" opacity="0.4" />
+  </g>
+
+  <!-- Linha divisória -->
+  <line x1="160" y1="20" x2="160" y2="100" stroke="#cbd5e1" stroke-width="2" />
+
+  <!-- Tipografia Institucional SEDUC / GOVERNO DO PARÁ -->
+  <g transform="translate(175, 22)" font-family="system-ui, -apple-system, sans-serif">
+    <text x="0" y="22" font-size="20" font-weight="900" fill="#0f172a" letter-spacing="1">
+      SEDUC
+      <tspan font-size="16" font-weight="700" fill="#dc2626"> PARÁ</tspan>
+    </text>
+    <text x="0" y="44" font-size="11" font-weight="700" fill="#475569" letter-spacing="0.5">
+      SECRETARIA DE ESTADO DE EDUCAÇÃO
+    </text>
+    <text x="0" y="62" font-size="10.5" font-weight="600" fill="#0284c7" letter-spacing="0.5">
+      DRE ALTAMIRA · NÚCLEO DE ED. ESPECIAL
+    </text>
+    <text x="0" y="78" font-size="9" font-weight="600" fill="#64748b">
+      GOVERNO DO ESTADO DO PARÁ
+    </text>
+  </g>
+</svg>
