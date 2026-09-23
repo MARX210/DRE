@@ -28,8 +28,33 @@ import {
   INITIAL_PEIS
 } from './mockData';
 import { calcularStatusAtendimento, calcularPdiPendente, calcularIdade } from './status';
+import { 
+  isSupabaseConfigured, 
+  checkSupabaseConnection 
+} from './supabase/client';
+import { 
+  fetchFullDataFromSupabase, 
+  seedInitialDataToSupabase,
+  dbUpsertAluno,
+  dbInativarAluno,
+  dbUpsertEscola,
+  dbInativarEscola,
+  dbUpsertProfissional,
+  dbInativarProfissional,
+  dbUpsertTurma,
+  dbDeleteTurma,
+  dbUpsertPdi,
+  dbUpsertOficio,
+  dbInsertAuditLog,
+  dbUpsertProfile,
+  dbUpdateProfileStatus,
+  dbDeleteProfile,
+  toUUID,
+  generateUUID,
+  MASTER_USER_ID
+} from './supabase/syncService';
 
-const STORAGE_KEY = 'seduc_pa_aee_v2_regional_store';
+const STORAGE_KEY = 'seduc_pa_aee_v5_clean_zero';
 
 interface AppStoreContextType {
   // Autenticação & Sessão
@@ -96,6 +121,13 @@ interface AppStoreContextType {
   ) => Promise<{ criados: number; atualizados: number; erros: string[] }>;
   importarAlunosEmLote: (linhasValidadas: any[]) => Promise<{ success: boolean; totalImportados: number; error?: string }>;
   restaurarDadosIniciais: () => void;
+
+  // Banco de Dados / Supabase
+  isDbConfigured: boolean;
+  dbStatus: 'connected' | 'syncing' | 'offline' | 'error';
+  dbMessage?: string;
+  lastSyncedAt: Date | null;
+  syncWithDatabase: (forceUpload?: boolean) => Promise<{ success: boolean; message: string }>;
 }
 
 const AppStoreContext = createContext<AppStoreContextType | null>(null);
@@ -109,38 +141,10 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
   const [profilesState, setProfilesState] = useState<Profile[]>(() => {
     const saved = localStorage.getItem(`${STORAGE_KEY}_profiles`);
-    const savedDeleted = localStorage.getItem(`${STORAGE_KEY}_deleted_profiles`);
-    const deletedIds: string[] = savedDeleted ? JSON.parse(savedDeleted) : [];
-
     if (!saved) return INITIAL_PROFILES;
     try {
       const parsed: Profile[] = JSON.parse(saved);
-      // Garantir que todos tenham campo de senha preenchido e Antonio Bispo tenha credenciais atualizadas
-      const withPasswords = parsed.map(p => {
-        const isBispo = p.id === 'u-antonio-bispo' || p.email.toLowerCase().includes('antonio.bispo');
-        if (isBispo) {
-          return {
-            ...p,
-            email: 'antonio.bispo@escola.seduc.pa.gov.br',
-            senha: p.senha && p.senha !== 'seduc@dre2026' ? p.senha : 'Bispo@2026',
-          };
-        }
-        if (!p.senha) {
-          const initMatch = INITIAL_PROFILES.find(ip => ip.id === p.id || ip.email.toLowerCase() === p.email.toLowerCase());
-          return { ...p, senha: initMatch?.senha || 'seduc@dre2026' };
-        }
-        return p;
-      });
-
-      // Incluir perfis padrão que não foram deletados
-      const missingInitial = INITIAL_PROFILES.filter(init => 
-        !deletedIds.includes(init.id) &&
-        !withPasswords.some(p => p.id === init.id || p.nome.toLowerCase() === init.nome.toLowerCase())
-      );
-      if (missingInitial.length > 0) {
-        return [...withPasswords, ...missingInitial];
-      }
-      return withPasswords;
+      return (parsed && parsed.length > 0) ? parsed : INITIAL_PROFILES;
     } catch {
       return INITIAL_PROFILES;
     }
@@ -200,7 +204,7 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   // Usuário ativo padrão: Diretor do Núcleo
   const [currentUserId, setCurrentUserId] = useState<string>(() => {
     const saved = localStorage.getItem(`${STORAGE_KEY}_currentUser`);
-    return saved || INITIAL_PROFILES[0].id;
+    return saved || MASTER_USER_ID;
   });
 
   // Persistência automática no localStorage
@@ -244,6 +248,99 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     localStorage.setItem(`${STORAGE_KEY}_currentUser`, currentUserId);
   }, [currentUserId]);
 
+  // Estado de Sincronização com o Banco de Dados (Supabase / PostgreSQL)
+  const [dbStatus, setDbStatus] = useState<'connected' | 'syncing' | 'offline' | 'error'>(
+    isSupabaseConfigured ? 'syncing' : 'offline'
+  );
+  const [dbMessage, setDbMessage] = useState<string>('');
+  const [lastSyncedAt, setLastSyncedAt] = useState<Date | null>(null);
+
+  const syncWithDatabase = useCallback(async (forceUpload = false) => {
+    if (!isSupabaseConfigured) {
+      setDbStatus('offline');
+      setDbMessage('Supabase não configurado');
+      return { success: false, message: 'Supabase não configurado no .env.local' };
+    }
+
+    try {
+      setDbStatus('syncing');
+      setDbMessage('Conectando ao banco de dados...');
+      const conn = await checkSupabaseConnection();
+      if (!conn.connected) {
+        setDbStatus('error');
+        setDbMessage(conn.error || 'Falha ao conectar');
+        return { success: false, message: conn.error || 'Erro de conexão' };
+      }
+
+      if (forceUpload) {
+        setDbMessage('Enviando dados locais para o banco...');
+        const seedRes = await seedInitialDataToSupabase({
+          escolas: escolasState,
+          profiles: profilesState,
+          profissionais: profissionaisState,
+          turmas: turmasState,
+          alunos: alunosState,
+          pdis: pdisState,
+          oficios: oficiosState,
+          auditLogs: auditLogsState
+        });
+        if (!seedRes.success) {
+          throw new Error(seedRes.error || 'Erro ao sincronizar');
+        }
+        setDbStatus('connected');
+        setLastSyncedAt(new Date());
+        setDbMessage('Todos os dados foram salvos no banco com sucesso!');
+        return { success: true, message: 'Todos os dados foram salvos no banco com sucesso!' };
+      }
+
+      // Obter lista de usuários já excluídos localmente para sincronização com o banco
+      const savedDeleted = localStorage.getItem(`${STORAGE_KEY}_deleted_profiles`);
+      const deletedIds: string[] = savedDeleted ? JSON.parse(savedDeleted) : [];
+
+      // Carregar dados existentes no banco
+      const cloudData = await fetchFullDataFromSupabase();
+      if (cloudData) {
+        if (cloudData.escolas && cloudData.escolas.length > 0) {
+          setEscolasState(cloudData.escolas);
+        }
+        if (cloudData.profiles && cloudData.profiles.length > 0) {
+          const validProfiles = cloudData.profiles.map(cp => {
+            const local = profilesState.find(lp => lp.id === cp.id || toUUID(lp.id) === cp.id);
+            return {
+              ...cp,
+              senha: local?.senha || 'seduc@dre2026',
+              ultimo_acesso: local?.ultimo_acesso || cp.ultimo_acesso
+            };
+          });
+          setProfilesState(validProfiles);
+          localStorage.setItem(`${STORAGE_KEY}_profiles`, JSON.stringify(validProfiles));
+        }
+        setProfissionaisState(cloudData.profissionais || []);
+        setTurmasState(cloudData.turmas || []);
+        setAlunosState(cloudData.alunos || []);
+        setPdisState(cloudData.pdis || []);
+        setOficiosState(cloudData.oficios || []);
+        setAuditLogsState(cloudData.auditLogs || []);
+      }
+
+      setDbStatus('connected');
+      setLastSyncedAt(new Date());
+      setDbMessage('Conectado ao Supabase (PostgreSQL)');
+      return { success: true, message: 'Conectado e sincronizado com o banco.' };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setDbStatus('error');
+      setDbMessage(msg);
+      return { success: false, message: msg };
+    }
+  }, [escolasState, profilesState, profissionaisState, turmasState, alunosState, pdisState, oficiosState, auditLogsState]);
+
+  useEffect(() => {
+    if (isSupabaseConfigured) {
+      syncWithDatabase(false);
+    }
+  }, []);
+
   const currentUser = useMemo(() => {
     return profilesState.find(p => p.id === currentUserId) || profilesState[0];
   }, [profilesState, currentUserId]);
@@ -271,7 +368,7 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
   const registrarLog = useCallback((acao: string, tabela: string, registroId?: string, detalhes?: Record<string, unknown>) => {
     const novoLog: AuditLogItem = {
-      id: `aud-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      id: generateUUID(),
       user_id: currentUser.id,
       user_nome: currentUser.nome,
       acao,
@@ -281,6 +378,7 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       created_at: new Date().toISOString(),
     };
     setAuditLogsState(prev => [novoLog, ...prev.slice(0, 499)]); // limite de 500 logs
+    dbInsertAuditLog(novoLog);
   }, [currentUser]);
 
   // Aplicação das políticas de segurança RLS sobre os dados expostos
@@ -374,21 +472,26 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
       if (alunoId) {
         // Atualizar
+        let alunoAtualizado: Aluno | null = null;
         setAlunosState(prev => prev.map(item => {
           if (item.id === alunoId) {
-            return {
+            alunoAtualizado = {
               ...item,
               ...dados,
               updated_by: currentUser.id,
               updated_at: now,
             } as Aluno;
+            return alunoAtualizado;
           }
           return item;
         }));
+        if (alunoAtualizado) {
+          await dbUpsertAluno(alunoAtualizado);
+        }
         registrarLog('ATUALIZACAO_ALUNO', 'alunos', alunoId, { codigo: dados.codigo, nome: dados.nome });
       } else {
         // Criar
-        alunoId = `a-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+        alunoId = generateUUID();
         const novoAluno: Aluno = {
           id: alunoId,
           codigo: dados.codigo || `ALU-${Date.now().toString().slice(-4)}`,
@@ -418,6 +521,7 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         };
 
         setAlunosState(prev => [novoAluno, ...prev]);
+        await dbUpsertAluno(novoAluno);
         registrarLog('CRIACAO_ALUNO', 'alunos', alunoId, { codigo: novoAluno.codigo, nome: novoAluno.nome });
       }
 
@@ -436,6 +540,7 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     }
 
     setAlunosState(prev => prev.map(a => a.id === id ? { ...a, ativo: false, updated_at: new Date().toISOString() } : a));
+    dbInativarAluno(id);
     registrarLog('INATIVACAO_ALUNO', 'alunos', id, { codigo: alvo.codigo, nome: alvo.nome });
     return { success: true };
   }, [alunosState, ehNucleo, minhaEscolaId, registrarLog]);
@@ -446,22 +551,27 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     }
 
     if (dados.id) {
+      let escolaAtualizada: Escola | null = null;
       setEscolasState(prev => prev.map(e => {
         if (e.id === dados.id) {
           const srmStatus = dados.srm_status || e.srm_status;
-          return {
+          escolaAtualizada = {
             ...e,
             ...dados,
             possui_srm: srmStatus ? (srmStatus === 'ativa' || srmStatus === 'inativa') : e.possui_srm,
             updated_at: new Date().toISOString()
           } as Escola;
+          return escolaAtualizada;
         }
         return e;
       }));
+      if (escolaAtualizada) {
+        await dbUpsertEscola(escolaAtualizada);
+      }
       registrarLog('ATUALIZACAO_ESCOLA', 'escolas', dados.id, { nome: dados.nome, municipio: dados.municipio });
       return { success: true, id: dados.id };
     } else {
-      const novoId = `e-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+      const novoId = generateUUID();
       const siglaMuni = (dados.municipio || 'ALT').substring(0, 3).toUpperCase();
       const srmStatus = dados.srm_status || (dados.possui_srm ? 'ativa' : 'nao_possui');
       const nova: Escola = {
@@ -489,6 +599,7 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         created_at: new Date().toISOString(),
       };
       setEscolasState(prev => [nova, ...prev]);
+      await dbUpsertEscola(nova);
       registrarLog('CRIACAO_ESCOLA', 'escolas', novoId, { nome: nova.nome, codigo: nova.codigo, municipio: nova.municipio });
       return { success: true, id: novoId };
     }
@@ -497,6 +608,7 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const inativarEscola = useCallback(async (id: string) => {
     if (!ehNucleo) return { success: false, error: 'Apenas a equipe do Núcleo pode inativar escolas.' };
     setEscolasState(prev => prev.map(e => e.id === id ? { ...e, ativa: false } : e));
+    dbInativarEscola(id);
     registrarLog('INATIVACAO_ESCOLA', 'escolas', id);
     return { success: true };
   }, [ehNucleo, registrarLog]);
@@ -508,11 +620,21 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     }
 
     if (dados.id) {
-      setTurmasState(prev => prev.map(t => t.id === dados.id ? { ...t, ...dados } as Turma : t));
+      let turmaAtualizada: Turma | null = null;
+      setTurmasState(prev => prev.map(t => {
+        if (t.id === dados.id) {
+          turmaAtualizada = { ...t, ...dados } as Turma;
+          return turmaAtualizada;
+        }
+        return t;
+      }));
+      if (turmaAtualizada) {
+        await dbUpsertTurma(turmaAtualizada);
+      }
       registrarLog('ATUALIZACAO_TURMA', 'turmas', dados.id, { nome: dados.nome });
       return { success: true, id: dados.id };
     } else {
-      const novoId = `t-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+      const novoId = generateUUID();
       const nova: Turma = {
         id: novoId,
         escola_id: escolaAlvo!,
@@ -523,6 +645,7 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         created_at: new Date().toISOString(),
       };
       setTurmasState(prev => [nova, ...prev]);
+      await dbUpsertTurma(nova);
       registrarLog('CRIACAO_TURMA', 'turmas', novoId, { codigo: nova.codigo, escola_id: nova.escola_id });
       return { success: true, id: novoId };
     }
@@ -534,6 +657,7 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     if (!ehNucleo && turma.escola_id !== minhaEscolaId) return { success: false, error: 'Permissão negada' };
 
     setTurmasState(prev => prev.filter(t => t.id !== id));
+    dbDeleteTurma(id);
     registrarLog('EXCLUSAO_TURMA', 'turmas', id);
     return { success: true };
   }, [turmasState, ehNucleo, minhaEscolaId, registrarLog]);
@@ -545,11 +669,21 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     }
 
     if (dados.id) {
-      setProfissionaisState(prev => prev.map(p => p.id === dados.id ? { ...p, ...dados } as Profissional : p));
+      let profAtualizado: Profissional | null = null;
+      setProfissionaisState(prev => prev.map(p => {
+        if (p.id === dados.id) {
+          profAtualizado = { ...p, ...dados } as Profissional;
+          return profAtualizado;
+        }
+        return p;
+      }));
+      if (profAtualizado) {
+        await dbUpsertProfissional(profAtualizado);
+      }
       registrarLog('ATUALIZACAO_PROFISSIONAL', 'profissionais', dados.id, { nome: dados.nome });
       return { success: true, id: dados.id };
     } else {
-      const novoId = `p-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+      const novoId = generateUUID();
       const novo: Profissional = {
         id: novoId,
         escola_id: escolaAlvo!,
@@ -561,6 +695,7 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         created_at: new Date().toISOString(),
       };
       setProfissionaisState(prev => [novo, ...prev]);
+      await dbUpsertProfissional(novo);
       registrarLog('CRIACAO_PROFISSIONAL', 'profissionais', novoId, { nome: novo.nome, tipo: novo.tipo });
       return { success: true, id: novoId };
     }
@@ -572,6 +707,7 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     if (!ehNucleo && prof.escola_id !== minhaEscolaId) return { success: false, error: 'Permissão negada' };
 
     setProfissionaisState(prev => prev.map(p => p.id === id ? { ...p, ativo: false } : p));
+    dbInativarProfissional(id);
     registrarLog('INATIVACAO_PROFISSIONAL', 'profissionais', id);
     return { success: true };
   }, [profissionaisState, ehNucleo, minhaEscolaId, registrarLog]);
@@ -601,11 +737,21 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     }
 
     if (dados.id) {
-      setPdisState(prev => prev.map(p => p.id === dados.id ? { ...p, ...dados, updated_at: now } as PDI : p));
+      let pdiAtualizado: PDI | null = null;
+      setPdisState(prev => prev.map(p => {
+        if (p.id === dados.id) {
+          pdiAtualizado = { ...p, ...dados, updated_at: now } as PDI;
+          return pdiAtualizado;
+        }
+        return p;
+      }));
+      if (pdiAtualizado) {
+        await dbUpsertPdi(pdiAtualizado);
+      }
       registrarLog('ATUALIZACAO_PDI', 'pdis', dados.id, { aluno_id: aluno.id, ano });
       return { success: true, id: dados.id };
     } else {
-      const novoId = `pdi-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+      const novoId = generateUUID();
       const novo: PDI = {
         id: novoId,
         aluno_id: aluno.id,
@@ -620,6 +766,7 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         updated_at: now,
       };
       setPdisState(prev => [novo, ...prev]);
+      await dbUpsertPdi(novo);
       registrarLog('CRIACAO_PDI', 'pdis', novoId, { aluno_id: aluno.id, ano });
       return { success: true, id: novoId };
     }
@@ -636,7 +783,7 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       registrarLog('ATUALIZACAO_ESTUDO_CASO', 'estudos_de_caso', dados.id, { aluno_id: dados.aluno_id });
       return { success: true, id: dados.id };
     } else {
-      const novoId = `ec-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+      const novoId = generateUUID();
       const novo: EstudoDeCaso = {
         ...(dados as EstudoDeCaso),
         id: novoId,
@@ -668,7 +815,7 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       registrarLog('ATUALIZACAO_PEI', 'peis', dados.id, { aluno_id: dados.aluno_id });
       return { success: true, id: dados.id };
     } else {
-      const novoId = `pei-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+      const novoId = generateUUID();
       const novo: PEIOfficial = {
         ...(dados as PEIOfficial),
         id: novoId,
@@ -739,21 +886,26 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     const now = new Date().toISOString();
 
     if (dados.id) {
+      let oficioAtualizado: Oficio | null = null;
       setOficiosState(prev => prev.map(o => {
         if (o.id === dados.id) {
-          return {
+          oficioAtualizado = {
             ...o,
             ...dados,
             emitido_em: dados.status === 'emitido' && !o.emitido_em ? now : o.emitido_em,
           } as Oficio;
+          return oficioAtualizado;
         }
         return o;
       }));
+      if (oficioAtualizado) {
+        await dbUpsertOficio(oficioAtualizado);
+      }
       registrarLog('ATUALIZACAO_OFICIO', 'oficios', dados.id, { numero: dados.numero, status: dados.status });
       return { success: true, id: dados.id };
     } else {
       const numero = proximoNumeroOficio(ano);
-      const novoId = `of-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+      const novoId = generateUUID();
       const novo: Oficio = {
         id: novoId,
         ano,
@@ -770,6 +922,7 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         alunos_ids: dados.alunos_ids || [],
       };
       setOficiosState(prev => [novo, ...prev]);
+      await dbUpsertOficio(novo);
       registrarLog('EMISSAO_OFICIO', 'oficios', novoId, { numero, ano, destinatario: novo.destinatario });
       return { success: true, id: novoId };
     }
@@ -782,42 +935,51 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     resumo: string
   ) => {
     if (!ehNucleo) return { success: false, error: 'Apenas o Núcleo pode registrar respostas de ofícios' };
+    let respOficio: Oficio | null = null;
     setOficiosState(prev => prev.map(o => {
       if (o.id === id) {
-        return {
+        respOficio = {
           ...o,
           status: 'respondido',
           resposta_recebida_em: dataResp,
           resposta_resumo: protocolo ? `[Protocolo ${protocolo}] ${resumo}` : resumo,
         };
+        return respOficio;
       }
       return o;
     }));
+    if (respOficio) {
+      await dbUpsertOficio(respOficio);
+    }
     registrarLog('RESPOSTA_OFICIO', 'oficios', id, { dataResp, protocolo, resumo });
     return { success: true };
   }, [ehNucleo, registrarLog]);
 
   const salvarUsuario = useCallback(async (dados: Partial<Profile>) => {
     if (dados.id) {
-      let senhaFinal: string | undefined;
+      let usuarioSalvo: Profile | null = null;
       const updated = profilesState.map(p => {
         if (p.id === dados.id) {
-          senhaFinal = (dados.senha && dados.senha.trim() !== '') ? dados.senha.trim() : p.senha;
-          return {
+          const senhaFinal = (dados.senha && dados.senha.trim() !== '') ? dados.senha.trim() : p.senha;
+          usuarioSalvo = {
             ...p,
             ...dados,
             senha: senhaFinal,
             escola_id: dados.papel?.startsWith('nucleo') ? null : (dados.escola_id !== undefined ? dados.escola_id : p.escola_id),
           } as Profile;
+          return usuarioSalvo;
         }
         return p;
       });
       setProfilesState(updated);
       localStorage.setItem(`${STORAGE_KEY}_profiles`, JSON.stringify(updated));
+      if (usuarioSalvo) {
+        await dbUpsertProfile(usuarioSalvo);
+      }
       registrarLog('ATUALIZACAO_USUARIO', 'profiles', dados.id, { nome: dados.nome, papel: dados.papel });
       return { success: true, id: dados.id };
     } else {
-      const novoId = `u-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+      const novoId = generateUUID();
       const novo: Profile = {
         id: novoId,
         nome: dados.nome || 'Novo Usuário',
@@ -832,6 +994,7 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       const updated = [...profilesState, novo];
       setProfilesState(updated);
       localStorage.setItem(`${STORAGE_KEY}_profiles`, JSON.stringify(updated));
+      await dbUpsertProfile(novo);
       registrarLog('CRIACAO_USUARIO', 'profiles', novoId, { email: novo.email, papel: novo.papel });
       return { success: true, id: novoId };
     }
@@ -847,6 +1010,7 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     const updated = profilesState.map(p => p.id === id ? { ...p, ativo: novoStatus } : p);
     setProfilesState(updated);
     localStorage.setItem(`${STORAGE_KEY}_profiles`, JSON.stringify(updated));
+    await dbUpdateProfileStatus(id, novoStatus);
 
     registrarLog(novoStatus ? 'ATIVACAO_USUARIO' : 'DESATIVACAO_USUARIO', 'profiles', id, {
       nome: target.nome,
@@ -878,6 +1042,9 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       deletedList.push(id);
       localStorage.setItem(`${STORAGE_KEY}_deleted_profiles`, JSON.stringify(deletedList));
     }
+
+    // Excluir definitivamente do Supabase (PostgreSQL)
+    await dbDeleteProfile(id);
 
     registrarLog('EXCLUSAO_USUARIO', 'profiles', id, { nome: target.nome, email: target.email, papel: target.papel });
     return { success: true };
@@ -980,7 +1147,7 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           copy[idx] = { ...copy[idx], ...e };
         } else {
           copy.push({
-            id: e.id || `e-imp-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
+            id: e.id || generateUUID(),
             codigo: e.codigo,
             nome: e.nome,
             municipio: e.municipio || 'Altamira',
@@ -1006,7 +1173,7 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           copy[idx] = { ...copy[idx], ...t };
         } else {
           copy.push({
-            id: t.id || `t-imp-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
+            id: t.id || generateUUID(),
             codigo: t.codigo,
             nome: t.nome || t.codigo,
             escola_id: t.escola_id,
@@ -1029,7 +1196,7 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           copy[idx] = { ...copy[idx], ...p };
         } else {
           copy.push({
-            id: p.id || `p-imp-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
+            id: p.id || generateUUID(),
             nome: p.nome,
             escola_id: p.escola_id,
             tipo: p.tipo,
@@ -1063,7 +1230,7 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           atualizados++;
         } else {
           copy.push({
-            id: a.id || `a-imp-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+            id: a.id || generateUUID(),
             codigo: a.codigo,
             nome: a.nome,
             data_nascimento: a.data_nascimento,
@@ -1184,6 +1351,11 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     importarLote,
     importarAlunosEmLote,
     restaurarDadosIniciais,
+    isDbConfigured: isSupabaseConfigured,
+    dbStatus,
+    dbMessage,
+    lastSyncedAt,
+    syncWithDatabase,
   }), [
     isAuthenticated,
     login,
@@ -1233,6 +1405,10 @@ export const AppStoreProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     importarLote,
     importarAlunosEmLote,
     restaurarDadosIniciais,
+    dbStatus,
+    dbMessage,
+    lastSyncedAt,
+    syncWithDatabase,
   ]);
 
   return (
